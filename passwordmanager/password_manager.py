@@ -1,9 +1,11 @@
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 from getpass import getpass
 import json
 import os
 import secrets
 import string
+from argon2.low_level import hash_secret_raw, Type
+import base64
 
 class PasswordManager:
 
@@ -11,60 +13,117 @@ class PasswordManager:
         self.key = None
         self.password_file = None
         self.password_dict = {}
+        self.salt = None
 
-    def create_key(self, path):
-        self.key = Fernet.generate_key()
+        # Argon2 parameters
+        self.time_cost = 3
+        self.memory_cost = 65536
+        self.parallelism = 4
+        self.hash_len = 32
 
-        with open(path, "wb") as f:
-            f.write(self.key)
+    def derive_key(self, master_password):
+        key = hash_secret_raw(secret=master_password.encode(), salt=self.salt, time_cost=self.time_cost, memory_cost=self.memory_cost, parallelism=self.parallelism, hash_len=self.hash_len, type=Type.ID)
 
-        print("Key created successfully")
+        return base64.urlsafe_b64encode(key)
 
-    def load_key(self, path):
-        with open(path, "rb") as f:
-            self.key = f.read()
+    def create_master_passwoord(self):
+        master_password = getpass("Create master password: ")
+        confirm_password = getpass("Confirm master password: ")
 
-        print("Key loaded successfully")
+        if master_password != confirm_password:
+            print("Passwords do not match")
+            return False
+
+        if not master_password:
+            print("Master password cannot be empty")
+            return False
+
+        self.salt = secrets.token_bytes(16)
+        self.key = self.derive_key(master_password)
+
+        print("Master password created successfully")
+        return True
 
     def save_vault(self):
         if self.password_file is None:
             print("No password file loaded")
-            return
+            return False
+
+        if self.key is None:
+            print("Vault is locked")
+            return False
+
+        data = {
+            "kdf": {
+                "algorithm": "argon2id",
+                "time_cost": self.time_cost,
+                "memory_cost": self.memory_cost,
+                "parallelism": self.parallelism,
+                "hash_len": self.hash_len
+            },
+            "salt": base64.b64encode(self.salt).decode(),
+            "verification": Fernet(self.key).encrypt(b"PASSWORD_MANAGER_VAULT").decode(),
+            "entries": self.password_dict
+        }
 
         with open(self.password_file, "w", encoding="utf-8") as f:
-            json.dump(self.password_dict, f, indent=4)
+            json.dump(data, f, indent=4)
+
+        return True
 
     def create_password_file(self, path, initial_values=None):
+        if os.path.exists(path):
+            print("A vault with this name already exists")
+            return False
+
         self.password_file = path
         self.password_dict = {}
 
-        if initial_values is not None:
-            for site, values in initial_values.items():
-                encrypted = Fernet(self.key).encrypt(
-                    values["password"].encode()
-                ).decode()
-
-                self.password_dict[site] = {
-                    "username": values["username"],
-                    "password": encrypted,
-                    "url": values["url"]
-                }
+        if not self.create_master_passwoord():
+            self.password_file = None
+            return False
 
         self.save_vault()
-
         print("Password file created successfully")
+        return True
 
     def load_password_file(self, path):
-        self.password_file = path
-
         if not os.path.exists(path):
-            self.password_dict = {}
-            return
+            print("Vault does not exist")
+            return False
 
-        with open(path, "r", encoding="utf-8") as f:
-            self.password_dict = json.load(f)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            kdf = data["kdf"]
 
-        print("Vault loaded")
+            self.time_cost = kdf["time_cost"]
+            self.memory_cost = kdf["memory_cost"]
+            self.parallelism = kdf["parallelism"]
+            self.hash_len = kdf["hash_len"]
+
+            self.salt = base64.b64decode(data["salt"])
+
+            master_password = getpass("Enter master password: ")
+            self.key = self.derive_key(master_password)
+            verification = data["verification"]
+            Fernet(self.key).decrypt(verification.encode())
+
+            self.password_dict = data["entries"]
+            self.password_file = path
+                
+            print("Vault loaded")
+            return True
+        
+        except InvalidToken:
+            print("Incorrect master password")
+            self.key = None
+            return False
+        
+        except (KeyError, ValueError, json.JSONDecodeError):
+            print("Invalid or corrupted vault")
+            self.key = None
+            return False
 
     def generate_password(self, length=16):
         character_sets = [string.ascii_uppercase, string.ascii_lowercase, string.digits, string.punctuation]
@@ -82,6 +141,10 @@ class PasswordManager:
         return ''.join(password)
 
     def add_password(self, site, username, password, url):
+        if self.key is None:
+            print("Vault is locked")
+            return
+
         encrypted = Fernet(self.key).encrypt(password.encode()).decode()
 
         self.password_dict[site] = {
@@ -94,6 +157,10 @@ class PasswordManager:
         print(f"Password for {site} added successfully")
 
     def delete_password(self, site):
+        if self.key is None:
+            print("Vault is locked")
+            return
+
         if site not in self.password_dict:
             print(f"No password found for {site}")
             return
@@ -103,6 +170,10 @@ class PasswordManager:
         print(f"Password for {site} deleted successfully")
 
     def update_password(self, site, new_password):
+        if self.key is None:
+            print("Vault is locked")
+            return
+
         if site not in self.password_dict:
             print(f"No password found for {site}")
             return
@@ -113,112 +184,18 @@ class PasswordManager:
         print(f"Password for {site} updated successfully")
 
     def get_password(self, site):
+        if self.key is None:
+            print("Vault is locked")
+            return None
+
         if site not in self.password_dict:
+            print(f"No password found for {site}")
             return None
 
         encrypted = self.password_dict[site]["password"]
-        return Fernet(self.key).decrypt(encrypted.encode()).decode()
 
-def main():
-
-    pm = PasswordManager()
-
-    print("""
-    (1) Create a new key
-    (2) Load an existing key
-    (3) Create a new password file
-    (4) Load existing password file
-    (5) Add a new password
-    (6) Delete a password
-    (7) Update a password
-    (8) Get a password
-    (q) Quit
-    """)
-
-    done = False
-
-    while not done:
-
-        choice = input("Enter your choice: ")
-
-        # Create key
-        if choice == "1":
-            path = input("Enter key path: ")
-            pm.create_key(path)
-
-        # Load key
-        elif choice == "2":
-            path = input("Enter key path: ")
-            pm.load_key(path)
-
-        # Create JSON file
-        elif choice == "3":
-            path = input("Enter JSON file path: ")
-            pm.create_password_file(path)
-
-        # Load JSON file
-        elif choice == "4":
-            path = input("Enter JSON file path: ")
-
-            pm.load_password_file(path)
-
-        # Add a password
-        elif choice == "5":
-            site = input("Enter the site: ")
-            username = input("Enter the username: ")
-
-            gen_pass = input("Do you want to generate a password (y/n): ").lower()
-            if gen_pass == 'y':
-                password = pm.generate_password()
-            elif gen_pass == 'n':
-                password = getpass("Enter the password: ")
-            else:
-                print("Invalid choice")
-                continue
-
-            url = input("Enter URL: ")
-
-            pm.add_password(
-                site,
-                username,
-                password,
-                url
-            )
-
-        # Delete a password
-        elif choice == "6":
-            site = input("Enter the site: ")
-            pm.delete_password(site)
-
-        # Update a password
-        elif choice == "7":
-            site = input("Enter the site: ")
-
-            gen_pass = input("Do you want to generate the new password (y/n): ").lower()
-            if gen_pass == 'y':
-                new_password = pm.generate_password()
-            elif gen_pass == 'n':
-                new_password = getpass("Enter the password: ")
-            else:
-                print("Invalid choice")
-                continue
-
-            pm.update_password(site, new_password)
-
-        # Get a password
-        elif choice == "8":
-            site = input("What site do you want: ")
-            password = pm.get_password(site)
-
-            if password:
-                print(f"Password for {site}: {password}")
-
-        # Exit
-        elif choice == "q":
-            done = True
-
-        else:
-            print("Invalid choice")
-
-if __name__ == "__main__":
-    main()
+        try:
+            return Fernet(self.key).decrypt(encrypted.encode()).decode()
+        except InvalidToken:
+            print("Unable to decrypt password")
+            return None
