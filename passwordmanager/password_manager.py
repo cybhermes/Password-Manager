@@ -74,26 +74,42 @@ class PasswordManager:
 
         new_salt = secrets.token_bytes(16)
 
-        old_key = self._key
-        old_salt = self.salt
+        new_key_bytes = hash_secret_raw(secret=new_password.encode("utf-8"), salt=new_salt, time_cost=self.time_cost, memory_cost=self.memory_cost, parallelism=self.parallelism, hash_len=self.hash_len, type=Type.ID)
 
-        self.salt = new_salt
+        new_key = base64.urlsafe_b64encode(new_key_bytes)
+
+        vault_data = {
+            "entries": self.password_dict
+            }
+
+        plain_text = json.dumps(vault_data).encode("utf-8")
+        encrypted_vault = Fernet(new_key).encrypt(plain_text).decode("utf-8")
+
+        data = {
+            "version": 1,
+            "kdf": {
+                "algorithm": "argon2id",
+                "time_cost": self.time_cost,
+                "memory_cost": self.memory_cost,
+                "parallelism": self.parallelism,
+                "hash_len": self.hash_len
+            },
+            "salt": base64.b64encode(new_salt).decode("ascii"),
+            "cipher": {"algorithm": "fernet"},
+            "vault": encrypted_vault
+        }
 
         try:
-            new_key = self.derive_key(new_password)
-            self._key = new_key
-
-            if not self.save_vault():
-                raise RuntimeError("Failed to save vault")
-
-            print("Master password changed successfully")
-            return True
-        except Exception:
-            self._key = old_key
-            self.salt = old_salt
-
-            print("Failed tp change master password")
+            self._write_vault(data)
+        except OSError as exc:
+            print(f"Failed to change master password: {exc}")
             return False
+
+        self._key = new_key
+        self.salt = new_salt
+
+        print("Master password changed seccessfully")
+        return True
 
     def _write_vault(self, data):
         directory = os.path.dirname(os.path.abspath(self.password_file))
@@ -103,10 +119,9 @@ class PasswordManager:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4)
-
                 f.flush()
-                os.fsync(f.fileno())
-                os.replace(temp_path, self.password_file)
+                os.fsync(f.fileno()) 
+            os.replace(temp_path, self.password_file)
         except Exception:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
@@ -121,34 +136,35 @@ class PasswordManager:
             print("Vault is locked")
             return False
 
-        vault_data = {
-            "entries": self.password_dict
-        }
+        try:
+            vault_data = {
+                "entries": self.password_dict
+            }
 
-        plain_text = json.dumps(vault_data).encode("utf-8")
-        encrypted_vault = Fernet(self._key).encrypt(plain_text).decode()
+            plain_text = json.dumps(vault_data).encode("utf-8")
+            encrypted_vault = Fernet(self._key).encrypt(plain_text).decode()
 
-        data = {
-            "version": 1,
-            "kdf": {
-                "algorithm": "argon2id",
-                "time_cost": self.time_cost,
-                "memory_cost": self.memory_cost,
-                "parallelism": self.parallelism,
-                "hash_len": self.hash_len
-            },
-            "salt": base64.b64encode(self.salt).decode(),
-            "cipher": {
-                "algorithm": "fernet"
-            },
-            "vault": encrypted_vault
-        }
+            data = {
+                "version": 1,
+                "kdf": {
+                    "algorithm": "argon2id",
+                    "time_cost": self.time_cost,
+                    "memory_cost": self.memory_cost,
+                    "parallelism": self.parallelism,
+                    "hash_len": self.hash_len
+                },
+                "salt": base64.b64encode(self.salt).decode("ascii"),
+                "cipher": {
+                    "algorithm": "fernet"
+                },
+                "vault": encrypted_vault
+            }
 
-        with open(self.password_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4)
-
-        self._write_vault(data)
-        return True
+            self._write_vault(data)
+            return True
+        except (OSError, TypeError, ValueError) as exc:
+            print(f"Failed to save vault: {exc}")
+            return False
 
     def is_unlocked(self):
         return self.unlocked and self._key is not None
@@ -174,7 +190,13 @@ class PasswordManager:
 
         self.unlocked = True
 
-        self.save_vault()
+        if not self.save_vault():
+            self.lock_vault()
+            self.password_file = None
+            self.salt = None
+            print("Failed to creates vault")
+            return False
+
         print("Password file created successfully")
         return True
 
@@ -279,19 +301,34 @@ class PasswordManager:
             return False
 
     def generate_password(self, length=16):
-        character_sets = [string.ascii_uppercase, string.ascii_lowercase, string.digits, string.punctuation]
+        if type(length) is not int:
+            raise TypeError("Password length must be an integer")
 
-        if length < len(character_sets):
-            raise ValueError("Password length is too short for the selected character sets")
+        if not 8 <= length <= 128:
+            raise ValueError("Password length must be between 4 and 128")
 
-        password = [secrets.choice(characters) for characters in character_sets]
+        character_sets = [
+            string.ascii_uppercase,
+            string.ascii_lowercase,
+            string.digits,
+            string.punctuation
+        ]
 
-        all_characters = ''.join(character_sets)
-        password += [secrets.choice(all_characters) for _ in range(length - len(password))]
+        password = [
+            secrets.choice(characters)
+            for characters in character_sets
+        ]
+
+        all_characters = "".join(character_sets)
+
+        password.extend(
+            secrets.choice(all_characters)
+            for _ in range(length - len(password))
+        )
 
         secrets.SystemRandom().shuffle(password)
 
-        return ''.join(password)
+        return "".join(password)
 
     def add_password(self, site, username, password, url):
         if not self.is_unlocked():
@@ -301,6 +338,26 @@ class PasswordManager:
         if site in self.password_dict:
             print(f"A password for {site} already exists")
             return False
+
+        if not isinstance(site, str) or not site.strip():
+            print("Site cannot be empty")
+            return False
+
+        if not isinstance(username, str) or not username.strip():
+            print("Username cannot be empty")
+            return False
+
+        if not isinstance(password, str) or not password:
+            print("Password cannot be empty")
+            return False
+
+        if not isinstance(url, str):
+            print("URL must be a string")
+            return False
+
+        site = site.strip()
+        username = username.strip()
+        url = url.strip()
 
         self.password_dict[site] = {
             "username": username,
@@ -334,6 +391,10 @@ class PasswordManager:
 
         if site not in self.password_dict:
             print(f"No password found for {site}")
+            return False
+        
+        if not isinstance(new_password, str) or not new_password:
+            print("Password cannot be empty")
             return False
 
         self.password_dict[site]["password"] = new_password
