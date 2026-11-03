@@ -107,7 +107,7 @@ def main():
 
         # Change master password
         elif choice == "8":
-            pm.change_master_password
+            pm.change_master_password()
 
         # Lock vault
         elif choice == "9":
